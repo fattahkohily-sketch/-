@@ -1,10 +1,13 @@
 package com.example.bluetoothchess
 
-import android.bluetooth.BluetoothDevice
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.widget.Button
 import android.widget.GridLayout
 import android.widget.TextView
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.example.bluetoothchess.bluetooth.BluetoothController
@@ -17,6 +20,15 @@ class MainActivity : AppCompatActivity() {
     private var selectedPosition: Position? = null
     private val boardButtons = Array(8) { arrayOfNulls<Button>(8) }
 
+    private val permissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
+            val allGranted = results.all { it.value }
+            updateStatus(
+                if (allGranted) "Bluetooth ready. Choose Host or Join."
+                else "Bluetooth permissions are required to play."
+            )
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -26,17 +38,17 @@ class MainActivity : AppCompatActivity() {
         bluetoothController.onMoveReceived = { moveText ->
             runOnUiThread {
                 val move = Move.fromWireString(moveText)
-                if (move != null) {
-                    val accepted = chessGame.applyMove(move)
-                    if (accepted) {
-                        updateStatus(if (chessGame.isWhiteTurn) "White to move" else "Black to move")
-                        selectedPosition = null
-                        renderBoard()
-                    }
+                if (move != null && chessGame.applyMove(move)) {
+                    selectedPosition = null
+                    renderBoard()
+                    updateStatus(
+                        if (chessGame.isWhiteTurn) "White to move" else "Black to move"
+                    )
                 }
             }
         }
 
+        requestBluetoothPermissionsIfNeeded()
         setupBoard()
         renderBoard()
         bindActions()
@@ -48,34 +60,59 @@ class MainActivity : AppCompatActivity() {
         val joinButton = findViewById<Button>(R.id.joinButton)
 
         hostButton.setOnClickListener {
-            val result = bluetoothController.startServer()
-            if (result) {
-                updateStatus("Hosting a Bluetooth game")
-            } else {
-                updateStatus("Bluetooth not available or permissions missing")
+            if (!bluetoothController.hasPermissions()) {
+                requestBluetoothPermissionsIfNeeded()
+                return@setOnClickListener
             }
+
+            val result = bluetoothController.startServer()
+            updateStatus(
+                if (result) "Hosting a Bluetooth game"
+                else "Bluetooth not available or permissions missing"
+            )
         }
 
         joinButton.setOnClickListener {
+            if (!bluetoothController.hasPermissions()) {
+                requestBluetoothPermissionsIfNeeded()
+                return@setOnClickListener
+            }
+
             val devices = bluetoothController.getPairedDevices()
             if (devices.isEmpty()) {
-                updateStatus("No paired devices")
+                updateStatus("No paired devices found")
                 return@setOnClickListener
             }
 
             val names = devices.map { it.name ?: it.address }.toTypedArray()
+
             MaterialAlertDialogBuilder(this)
                 .setTitle("Choose device")
                 .setItems(names) { _, index ->
                     val chosen = devices[index]
                     val result = bluetoothController.connectToDevice(chosen)
-                    if (result) {
-                        updateStatus("Connected to ${chosen.name ?: chosen.address}")
-                    } else {
-                        updateStatus("Unable to connect")
-                    }
+                    updateStatus(
+                        if (result) "Connected to ${chosen.name ?: chosen.address}"
+                        else "Unable to connect"
+                    )
                 }
                 .show()
+        }
+    }
+
+    private fun requestBluetoothPermissionsIfNeeded() {
+        val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            )
+        } else {
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+
+        if (permissions.any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }) {
+            permissionLauncher.launch(permissions)
         }
     }
 
@@ -85,16 +122,17 @@ class MainActivity : AppCompatActivity() {
 
         for (row in 0..7) {
             for (column in 0..7) {
+                val params = GridLayout.LayoutParams(
+                    GridLayout.spec(row, 1f),
+                    GridLayout.spec(column, 1f)
+                ).apply {
+                    width = 0
+                    height = 0
+                    setMargins(2, 2, 2, 2)
+                }
+
                 val button = Button(this).apply {
-                    layoutParams = GridLayout.LayoutParams().apply {
-                        rowSpec = GridLayout.spec(row)
-                        columnSpec = GridLayout.spec(column)
-                        width = 0
-                        height = 0
-                        setMargins(2, 2, 2, 2)
-                        columnWeight = 1f
-                        rowWeight = 1f
-                    }
+                    layoutParams = params
                     setTextSize(20f)
                     setPadding(0, 0, 0, 0)
                     setBackgroundColor(getSquareColor(row, column))
@@ -109,18 +147,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun getSquareColor(row: Int, column: Int): Int {
         val isDark = (row + column) % 2 == 1
-        return if (isDark) {
-            ContextCompat.getColor(this, android.R.color.darker_gray)
-        } else {
-            ContextCompat.getColor(this, android.R.color.white)
-        }
+        val colorRes = if (isDark) android.R.color.darker_gray else android.R.color.white
+        return ContextCompat.getColor(this, colorRes)
     }
 
     private fun handleSquareClick(row: Int, column: Int) {
         val clickedPosition = Position(row, column)
         val piece = chessGame.board[row][column]
+        val currentSelection = selectedPosition
 
-        if (selectedPosition == null) {
+        if (currentSelection == null) {
             if (piece != null && piece.isWhite == chessGame.isWhiteTurn) {
                 selectedPosition = clickedPosition
                 renderBoard()
@@ -128,12 +164,15 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val move = Move(selectedPosition!!, clickedPosition)
+        val move = Move(currentSelection, clickedPosition)
+
         if (chessGame.applyMove(move)) {
             selectedPosition = null
             bluetoothController.sendMove(move.toWireString())
-            updateStatus(if (chessGame.isWhiteTurn) "White to move" else "Black to move")
             renderBoard()
+            updateStatus(
+                if (chessGame.isWhiteTurn) "White to move" else "Black to move"
+            )
         } else {
             selectedPosition = null
             renderBoard()
@@ -145,19 +184,20 @@ class MainActivity : AppCompatActivity() {
             for (column in 0..7) {
                 val button = boardButtons[row][column] ?: continue
                 val piece = chessGame.board[row][column]
-                val isSelected = selectedPosition == Position(row, column)
 
                 button.text = piece?.symbol ?: ""
                 button.setBackgroundColor(getSquareColor(row, column))
-                if (isSelected) {
-                    button.setBackgroundColor(ContextCompat.getColor(this, android.R.color.holo_blue_light))
+
+                if (selectedPosition == Position(row, column)) {
+                    button.setBackgroundColor(
+                        ContextCompat.getColor(this, android.R.color.holo_blue_light)
+                    )
                 }
             }
         }
     }
 
     private fun updateStatus(message: String) {
-        val statusView = findViewById<TextView>(R.id.statusText)
-        statusView.text = message
+        findViewById<TextView>(R.id.statusText).text = message
     }
 }
