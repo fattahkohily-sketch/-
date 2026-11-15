@@ -1,109 +1,202 @@
-package com.example.bluetoothchess.bluetooth
+package com.example.bluetoothchess
 
 import android.Manifest
-import android.annotation.SuppressLint
-import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothServerSocket
-import android.bluetooth.BluetoothSocket
-import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
-import java.io.InputStream
-import java.io.OutputStream
-import java.util.UUID
+import android.os.Bundle
+import android.widget.Button
+import android.widget.GridLayout
+import android.widget.TextView
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import com.example.bluetoothchess.bluetooth.BluetoothController
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 
-class BluetoothController(private val context: Context) {
-    var onMoveReceived: ((String) -> Unit)? = null
+class MainActivity : AppCompatActivity() {
 
-    private val adapter: BluetoothAdapter? = BluetoothAdapter.getDefaultAdapter()
-    private var socket: BluetoothSocket? = null
-    private var outputStream: OutputStream? = null
-    private var inputStream: InputStream? = null
-    private val uuid: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+    private lateinit var chessGame: ChessGame
+    private lateinit var bluetoothController: BluetoothController
+    private var selectedPosition: Position? = null
+    private val boardButtons = Array(8) { arrayOfNulls<Button>(8) }
 
-    fun isSupported(): Boolean = adapter != null
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { grantResults ->
+        val allGranted = grantResults.all { it.value }
+        updateStatus(
+            if (allGranted) "Bluetooth ready. Choose Host or Join." else "Bluetooth permissions are required to play."
+        )
+    }
 
-    fun hasPermissions(): Boolean {
-        val required = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            arrayOf(
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        chessGame = ChessGame()
+        bluetoothController = BluetoothController(this)
+        bluetoothController.onMoveReceived = { moveText ->
+            runOnUiThread {
+                val move = Move.fromWireString(moveText)
+                if (move != null) {
+                    val accepted = chessGame.applyMove(move)
+                    if (accepted) {
+                        updateStatus(if (chessGame.isWhiteTurn) "White to move" else "Black to move")
+                        selectedPosition = null
+                        renderBoard()
+                    }
+                }
+            }
+        }
+
+        requestBluetoothPermissionsIfNeeded()
+        setupBoard()
+        renderBoard()
+        bindActions()
+        updateStatus("White to move")
+    }
+
+    private fun bindActions() {
+        val hostButton = findViewById<Button>(R.id.hostButton)
+        val joinButton = findViewById<Button>(R.id.joinButton)
+
+        hostButton.setOnClickListener {
+            if (!bluetoothController.hasPermissions()) {
+                requestBluetoothPermissionsIfNeeded()
+                return@setOnClickListener
+            }
+
+            val result = bluetoothController.startServer()
+            if (result) {
+                updateStatus("Hosting a Bluetooth game")
+            } else {
+                updateStatus("Bluetooth not available or permissions missing")
+            }
+        }
+
+        joinButton.setOnClickListener {
+            if (!bluetoothController.hasPermissions()) {
+                requestBluetoothPermissionsIfNeeded()
+                return@setOnClickListener
+            }
+
+            val devices = bluetoothController.getPairedDevices()
+            if (devices.isEmpty()) {
+                updateStatus("No paired devices found")
+                return@setOnClickListener
+            }
+
+            val names = devices.map { it.name ?: it.address }.toTypedArray()
+            MaterialAlertDialogBuilder(this)
+                .setTitle("Choose device")
+                .setItems(names) { _, index ->
+                    val chosen = devices[index]
+                    val result = bluetoothController.connectToDevice(chosen)
+                    if (result) {
+                        updateStatus("Connected to ${chosen.name ?: chosen.address}")
+                    } else {
+                        updateStatus("Unable to connect")
+                    }
+                }
+                .show()
+        }
+    }
+
+    private fun requestBluetoothPermissionsIfNeeded() {
+        val permissions = when {
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> arrayOf(
                 Manifest.permission.BLUETOOTH_SCAN,
                 Manifest.permission.BLUETOOTH_CONNECT,
                 Manifest.permission.ACCESS_FINE_LOCATION
             )
-        } else {
-            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+            else -> arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
         }
 
-        return required.all { context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
-    }
-
-    @SuppressLint("MissingPermission")
-    fun getPairedDevices(): List<BluetoothDevice> = adapter?.bondedDevices?.toList() ?: emptyList()
-
-    @SuppressLint("MissingPermission")
-    fun startServer(): Boolean {
-        if (adapter == null || !hasPermissions()) return false
-        try {
-            val serverSocket: BluetoothServerSocket? = adapter.listenUsingRfcommWithServiceRecord(
-                "BluetoothChess",
-                uuid
-            )
-
-            Thread {
-                socket = serverSocket?.accept()
-                if (socket != null) {
-                    outputStream = socket?.outputStream
-                    inputStream = socket?.inputStream
-                    readIncomingMessages()
-                }
-            }.start()
-            return true
-        } catch (_: Exception) {
-            return false
+        if (permissions.any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }) {
+            permissionLauncher.launch(permissions)
         }
     }
 
-    @SuppressLint("MissingPermission")
-    fun connectToDevice(device: BluetoothDevice): Boolean {
-        if (adapter == null || !hasPermissions()) return false
-        return try {
-            socket = device.createRfcommSocketToServiceRecord(uuid)
-            socket?.connect()
-            outputStream = socket?.outputStream
-            inputStream = socket?.inputStream
-            readIncomingMessages()
-            true
-        } catch (_: Exception) {
-            false
-        }
-    }
+    private fun setupBoard() {
+        val boardContainer = findViewById<GridLayout>(R.id.boardContainer)
+        boardContainer.removeAllViews()
 
-    fun sendMove(message: String) {
-        val stream = outputStream ?: return
-        runCatching {
-            stream.write(message.toByteArray())
-            stream.flush()
-        }
-    }
-
-    private fun readIncomingMessages() {
-        val stream = inputStream ?: return
-        val buffer = ByteArray(1024)
-
-        Thread {
-            while (true) {
-                try {
-                    val read = stream.read(buffer)
-                    if (read <= 0) break
-                    val message = String(buffer, 0, read).trim()
-                    if (message.isNotEmpty()) {
-                        onMoveReceived?.invoke(message)
+        for (row in 0..7) {
+            for (column in 0..7) {
+                val button = Button(this).apply {
+                    layoutParams = GridLayout.LayoutParams().apply {
+                        rowSpec = GridLayout.spec(row)
+                        columnSpec = GridLayout.spec(column)
+                        width = 0
+                        height = 0
+                        setMargins(2, 2, 2, 2)
+                        columnWeight = 1f
+                        rowWeight = 1f
                     }
-                } catch (_: Exception) {
-                    break
+                    setTextSize(20f)
+                    setPadding(0, 0, 0, 0)
+                    setBackgroundColor(getSquareColor(row, column))
+                    setOnClickListener { handleSquareClick(row, column) }
+                }
+
+                boardButtons[row][column] = button
+                boardContainer.addView(button)
+            }
+        }
+    }
+
+    private fun getSquareColor(row: Int, column: Int): Int {
+        val isDark = (row + column) % 2 == 1
+        return if (isDark) {
+            ContextCompat.getColor(this, android.R.color.darker_gray)
+        } else {
+            ContextCompat.getColor(this, android.R.color.white)
+        }
+    }
+
+    private fun handleSquareClick(row: Int, column: Int) {
+        val clickedPosition = Position(row, column)
+        val piece = chessGame.board[row][column]
+
+        if (selectedPosition == null) {
+            if (piece != null && piece.isWhite == chessGame.isWhiteTurn) {
+                selectedPosition = clickedPosition
+                renderBoard()
+            }
+            return
+        }
+
+        val move = Move(selectedPosition!!, clickedPosition)
+        if (chessGame.applyMove(move)) {
+            selectedPosition = null
+            bluetoothController.sendMove(move.toWireString())
+            updateStatus(if (chessGame.isWhiteTurn) "White to move" else "Black to move")
+            renderBoard()
+        } else {
+            selectedPosition = null
+            renderBoard()
+        }
+    }
+
+    private fun renderBoard() {
+        for (row in 0..7) {
+            for (column in 0..7) {
+                val button = boardButtons[row][column] ?: continue
+                val piece = chessGame.board[row][column]
+                val isSelected = selectedPosition == Position(row, column)
+
+                button.text = piece?.symbol ?: ""
+                button.setBackgroundColor(getSquareColor(row, column))
+                if (isSelected) {
+                    button.setBackgroundColor(ContextCompat.getColor(this, android.R.color.holo_blue_light))
                 }
             }
-        }.start()
+        }
+    }
+
+    private fun updateStatus(message: String) {
+        val statusView = findViewById<TextView>(R.id.statusText)
+        statusView.text = message
     }
 }
