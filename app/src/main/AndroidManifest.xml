@@ -1,45 +1,112 @@
-<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+package com.example.bluetoothchess.bluetooth
 
-    <uses-permission
-        android:name="android.permission.BLUETOOTH"
-        android:maxSdkVersion="30" />
+import android.Manifest
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothServerSocket
+import android.bluetooth.BluetoothSocket
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import java.io.InputStream
+import java.io.OutputStream
+import java.util.UUID
 
-    <uses-permission
-        android:name="android.permission.BLUETOOTH_ADMIN"
-        android:maxSdkVersion="30" />
+class BluetoothController(private val context: Context) {
+    var onMoveReceived: ((String) -> Unit)? = null
 
-    <uses-permission
-        android:name="android.permission.ACCESS_FINE_LOCATION"
-        android:maxSdkVersion="30" />
+    private val adapter: BluetoothAdapter? = BluetoothAdapter.getDefaultAdapter()
+    private var socket: BluetoothSocket? = null
+    private var outputStream: OutputStream? = null
+    private var inputStream: InputStream? = null
+    private val uuid: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
-    <uses-permission
-        android:name="android.permission.ACCESS_COARSE_LOCATION"
-        android:maxSdkVersion="30" />
+    fun isSupported(): Boolean = adapter != null
 
-    <uses-permission
-        android:name="android.permission.BLUETOOTH_SCAN"
-        android:usesPermissionFlags="neverForLocation" />
+    fun hasPermissions(): Boolean {
+        val required = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            )
+        } else {
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
 
-    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+        return required.all { context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
+    }
 
-    <application
-        android:allowBackup="true"
-        android:icon="@mipmap/ic_launcher"
-        android:label="@string/app_name"
-        android:roundIcon="@mipmap/ic_launcher_round"
-        android:supportsRtl="true"
-        android:theme="@style/Theme.BluetoothChess">
+    @SuppressLint("MissingPermission")
+    fun getPairedDevices(): List<BluetoothDevice> = adapter?.bondedDevices?.toList() ?: emptyList()
 
-        <activity
-            android:name=".MainActivity"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+    @SuppressLint("MissingPermission")
+    fun startServer(): Boolean {
+        if (adapter == null || !hasPermissions()) return false
+        return try {
+            val serverSocket: BluetoothServerSocket? = adapter.listenUsingRfcommWithServiceRecord(
+                "BluetoothChess",
+                uuid
+            )
 
-    </application>
+            Thread {
+                try {
+                    socket = serverSocket?.accept()
+                    if (socket != null) {
+                        outputStream = socket?.outputStream
+                        inputStream = socket?.inputStream
+                        readIncomingMessages()
+                    }
+                } catch (_: Exception) {
+                }
+            }.start()
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
 
-</manifest>
+    @SuppressLint("MissingPermission")
+    fun connectToDevice(device: BluetoothDevice): Boolean {
+        if (adapter == null || !hasPermissions()) return false
+        return try {
+            socket = device.createRfcommSocketToServiceRecord(uuid)
+            socket?.connect()
+            outputStream = socket?.outputStream
+            inputStream = socket?.inputStream
+            readIncomingMessages()
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun sendMove(message: String) {
+        val stream = outputStream ?: return
+        runCatching {
+            stream.write(message.toByteArray())
+            stream.flush()
+        }
+    }
+
+    private fun readIncomingMessages() {
+        val stream = inputStream ?: return
+        val buffer = ByteArray(1024)
+
+        Thread {
+            while (true) {
+                try {
+                    val read = stream.read(buffer)
+                    if (read <= 0) break
+                    val message = String(buffer, 0, read).trim()
+                    if (message.isNotEmpty()) {
+                        onMoveReceived?.invoke(message)
+                    }
+                } catch (_: Exception) {
+                    break
+                }
+            }
+        }.start()
+    }
+}
